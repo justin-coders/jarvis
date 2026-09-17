@@ -1,5 +1,18 @@
 import platform as _platform
 import subprocess as _subprocess
+import sys as _sys
+
+# ── Make stdout/stderr UTF-8 tolerant ────────────────────────────────────────
+# On non-UTF-8 Windows consoles (cp1254/cp1252/cp936...) any print() containing
+# an emoji raises UnicodeEncodeError.  Several of those prints sit inside except
+# handlers, so the handler itself would blow up and skip the recovery code that
+# follows it — turning a recoverable error into a silent hang.  errors="replace"
+# makes every print safe.
+for _stream in (_sys.stdout, _sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass   # frozen builds may have no real stream attached
 
 # ── Nuclear: force CREATE_NO_WINDOW on EVERY subprocess call on Windows ───────
 # This patches Popen itself, so no per-file flag is needed anywhere.
@@ -10,9 +23,10 @@ if _platform.system() == "Windows":
         def __init__(self, args, **kw):
             kw["creationflags"] = kw.get("creationflags", 0) | _subprocess.CREATE_NO_WINDOW
             kw.pop("startupinfo", None)   # drop any stale/shared STARTUPINFO
-            super().__init__(args, **kw)
+            super().__init__(args, **                       kw)
 
     _subprocess.Popen = _Popen
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -58,13 +72,12 @@ from actions.background_monitor import (
 )
 from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import get_brief_enabled
-
+from core.plugin_loader        import discover_plugins
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
-
 
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
@@ -547,9 +560,6 @@ TOOL_DECLARATIONS = [
     },
 ]
 
-# --- Plugin system ---
-
-
 class JarvisLive:
 
     def __init__(self, ui: JarvisUI):
@@ -578,6 +588,43 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+
+        self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
+        _core_names = {t["name"] for t in TOOL_DECLARATIONS}
+        self._plugin_registry = discover_plugins(
+            plugins_dir=Path(__file__).resolve().parent / "plugins",
+            core_tool_names=_core_names,
+            logger=lambda msg: (print(f"[Plugins] {msg}"), self.ui.write_log(f"SYS: {msg}")),
+        )
+        self.ui.get_plugins = self._plugin_registry.list_for_ui
+        self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+
+    def plugin_say(self, instruction: str) -> None:
+        """
+        Thread-safe speech channel for plugins: lets a plugin ask JARVIS to
+        say something short WHILE its run() is still executing (plugins block
+        their executor thread, so they can't speak through the tool response
+        until they finish). The instruction is injected into the Live session
+        exactly like a proactive check-in; Gemini phrases it naturally in the
+        user's language. Silently a no-op when no session is connected.
+        """
+        loop = getattr(self, "_loop", None)
+        if not loop or not self.session:
+            return
+
+        async def _say():
+            try:
+                await self.session.send_client_content(
+                    turns={"parts": [{"text": instruction}]},
+                    turn_complete=True,
+                )
+            except Exception as e:
+                print(f"[PluginSay] {e}")
+
+        try:
+            asyncio.run_coroutine_threadsafe(_say(), loop)
+        except Exception as e:
+            print(f"[PluginSay] {e}")
 
     def _make_remote_key(self):
         """Called from Qt main thread when user presses Remote Control."""
@@ -687,13 +734,18 @@ class JarvisLive:
             parts.append(mem_str)
         parts.append(sys_prompt)
 
-        return types.LiveConnectConfig(
+        cfg = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
             input_audio_transcription={},
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": TOOL_DECLARATIONS}],
+            tools=[{"function_declarations": TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()}],
             session_resumption=types.SessionResumptionConfig(),
+            # Sliding-window compression: session never dies from a full context
+            # window — JARVIS can stay in one conversation for hours
+            context_window_compression=types.ContextWindowCompressionConfig(
+                sliding_window=types.SlidingWindow(),
+            ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -702,6 +754,13 @@ class JarvisLive:
                 )
             ),
         )
+        if self._enhanced_live:
+            # Affective dialog: JARVIS hears tone/emotion and adapts its voice.
+            # Proactive audio: JARVIS stays silent when speech isn't addressed
+            # to it (background chatter, talking to someone else in the room).
+            cfg["enable_affective_dialog"] = True
+            cfg["proactivity"] = types.ProactivityConfig(proactive_audio=True)
+        return types.LiveConnectConfig(**cfg)
 
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
@@ -872,7 +931,14 @@ class JarvisLive:
                 asyncio.create_task(_do_shutdown())
 
             else:
-                result = f"Unknown tool: {name}"
+                if self._plugin_registry.has(name):
+                    r = await loop.run_in_executor(
+                        None,
+                        lambda: self._plugin_registry.run(name, args, player=self.ui, session_memory=None)
+                    )
+                    result = r or "Done."
+                else:
+                    result = f"Unknown tool: {name}"
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
@@ -1178,14 +1244,18 @@ class JarvisLive:
                     await asyncio.sleep(1.0)
 
                 try:
-                    news_text = await asyncio.wait_for(news_done, timeout=4.0)
-                except Exception:
+                    news_text = await asyncio.wait_for(news_done, timeout=8.0)
+                except Exception as e:
+                    self.ui.write_log(f"SYS: News fetch timed out/failed: {e!r}")
                     news_text = ""
 
                 if not self.session:
                     return
 
-                if news_text and len(news_text) > 60:
+                failed = (not news_text) or news_text.startswith(
+                    ("No news found", "Search failed", "Please provide")
+                )
+                if not failed:
                     # Show on UI content panel immediately
                     self.ui.show_content("NEWS — top world news today", news_text)
 
@@ -1195,6 +1265,9 @@ class JarvisLive:
                         f"is displayed on screen. Do not call any tools.{lang_str}"
                     )
                 else:
+                    self.ui.write_log(
+                        f"SYS: News unavailable — backend returned: {news_text[:120]!r}"
+                    )
                     p2 = (
                         "News headlines could not be fetched right now. "
                         f"Let the user know briefly.{lang_str}"
@@ -1236,7 +1309,7 @@ class JarvisLive:
             client = _genai.Client(api_key=_get_api_key())
             resp   = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-2.5-flash",
+                model="gemini-flash-latest",
                 contents=prompt,
             )
             summary = (resp.text or "").strip()
@@ -1419,9 +1492,11 @@ class JarvisLive:
                 config = self._build_config()
 
                 # Fresh client on every reconnect — avoids stale HTTP session state
+                # v1alpha carries the enhanced audio features (affective dialog,
+                # proactive audio); if they get rejected we fall back to v1beta.
                 client = genai.Client(
                     api_key=_get_api_key(),
-                    http_options={"api_version": "v1beta"}
+                    http_options={"api_version": "v1alpha" if self._enhanced_live else "v1beta"}
                 )
 
                 async with (
@@ -1476,6 +1551,21 @@ class JarvisLive:
                 err_str = str(e)
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
+
+                # Enhanced audio features rejected by the server (preview API
+                # drift) — drop them and reconnect with the plain config.
+                if self._enhanced_live and (
+                    "INVALID_ARGUMENT" in err_str
+                    or "affective" in err_str.lower()
+                    or "proactiv" in err_str.lower()
+                    or "Unknown name" in err_str
+                    or "unexpected keyword" in err_str
+                ):
+                    self._enhanced_live = False
+                    self.ui.write_log(
+                        "SYS: Advanced audio features unavailable — reconnecting without them."
+                    )
+                    continue
 
                 # Invalid API key — stop hammering the API, prompt re-configuration
                 if "API key not valid" in err_str or "1007" in err_str:
